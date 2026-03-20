@@ -1,0 +1,887 @@
+#!/usr/bin/env python3
+"""
+watcher — CLI for the Watcher remote control system for Claude Code.
+
+Usage:
+  watcher start [--imessage] [--telegram] [--no-imessage] [--no-telegram]
+  watcher stop
+  watcher restart
+  watcher status
+  watcher sessions [list]
+  watcher sessions kill <name>
+  watcher sessions clean
+  watcher notify on|off|imessage|telegram [<name>]
+  watcher recent
+  watcher config
+  watcher logs
+  watcher install
+  watcher doctor
+  watcher history [<project>] [--today] [--limit N]
+"""
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+# Ensure src is on path
+SRC_DIR = Path(__file__).parent / "src"
+sys.path.insert(0, str(SRC_DIR))
+
+from config import (
+    ARCHIVE_DIR,
+    CONVERSATIONS_DIR,
+    ENABLED_FLAG,
+    HOOKS_DIR,
+    LOGS_DIR,
+    SESSIONS_DIR,
+    WATCH_DIR,
+    ensure_dirs,
+    get_active_channels,
+    is_enabled,
+    load_config,
+    save_config,
+    set_active_channels,
+    set_enabled,
+)
+from project_registry import all_projects, add_project
+from session_manager import session_manager
+
+LAUNCHAGENT_LABEL = "com.watcher.daemon"
+LAUNCHAGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LAUNCHAGENT_LABEL}.plist"
+WATCHERD_BIN = Path("/usr/local/bin/watcherd")
+WATCHER_BIN = Path("/usr/local/bin/watcher")
+
+PLIST_TEMPLATE = """\
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.watcher.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{watcherd_bin}</string>
+  </array>
+  <key>RunAtLoad</key>
+  <false/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>PathState</key>
+    <dict>
+      <key>{enabled_flag}</key>
+      <true/>
+    </dict>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>{log_out}</string>
+  <key>StandardErrorPath</key>
+  <string>{log_err}</string>
+  <key>ThrottleInterval</key>
+  <integer>5</integer>
+</dict>
+</plist>
+"""
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────
+
+
+def _print_table(rows: list[tuple], headers: tuple) -> None:
+    col_widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            col_widths[i] = max(col_widths[i], len(str(cell)))
+    fmt = "  ".join(f"{{:<{w}}}" for w in col_widths)
+    print(fmt.format(*headers))
+    print("  ".join("-" * w for w in col_widths))
+    for row in rows:
+        print(fmt.format(*[str(c) for c in row]))
+
+
+def _read_pid() -> int | None:
+    pid_file = WATCH_DIR / "daemon.pid"
+    try:
+        return int(pid_file.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _is_daemon_running() -> bool:
+    pid = _read_pid()
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+
+
+def _format_duration(seconds: float) -> str:
+    secs = int(seconds)
+    if secs < 60:
+        return f"{secs}s"
+    m, s = divmod(secs, 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m"
+
+
+def _channel_label(session) -> str:
+    parts = []
+    if session.notify_imessage:
+        parts.append("iMsg")
+    if session.notify_telegram:
+        parts.append("TG")
+    return " + ".join(parts) if parts else "muted"
+
+
+# ─── Commands ──────────────────────────────────────────────────────────────
+
+
+def cmd_start(args) -> int:
+    ensure_dirs()
+
+    # Determine which channels to activate
+    config = load_config()
+    all_configured = []
+    if config.get("imessage", {}).get("enabled"):
+        all_configured.append("imessage")
+    if config.get("telegram", {}).get("enabled"):
+        all_configured.append("telegram")
+
+    channels = list(all_configured)
+
+    if args.imessage:
+        channels = ["imessage"]
+    elif args.telegram:
+        channels = ["telegram"]
+    elif args.no_imessage:
+        channels = [c for c in channels if c != "imessage"]
+    elif args.no_telegram:
+        channels = [c for c in channels if c != "telegram"]
+
+    if not channels:
+        print("Warning: no channels configured. Run 'watcher install' first.")
+
+    set_active_channels(channels)
+    set_enabled(True)
+
+    # Try launchctl first (macOS)
+    if shutil.which("launchctl") and LAUNCHAGENT_PLIST.exists():
+        subprocess.run(
+            ["launchctl", "load", str(LAUNCHAGENT_PLIST)],
+            capture_output=True,
+        )
+        print(f"Watcher started — channels: {', '.join(channels) or 'none'}")
+        return 0
+
+    # Fallback: start daemon directly
+    watcherd = shutil.which("watcherd") or str(SRC_DIR / "watcherd.py")
+    log_out = LOGS_DIR / "watcherd.log"
+    log_err = LOGS_DIR / "watcherd-error.log"
+
+    with open(log_out, "a") as out, open(log_err, "a") as err:
+        proc = subprocess.Popen(
+            [sys.executable, watcherd],
+            stdout=out,
+            stderr=err,
+            start_new_session=True,
+        )
+    pid_file = WATCH_DIR / "daemon.pid"
+    pid_file.write_text(str(proc.pid) + "\n")
+    print(f"Watcher started (pid {proc.pid}) — channels: {', '.join(channels) or 'none'}")
+    return 0
+
+
+def cmd_stop(args) -> int:
+    set_enabled(False)
+
+    if shutil.which("launchctl") and LAUNCHAGENT_PLIST.exists():
+        subprocess.run(
+            ["launchctl", "unload", str(LAUNCHAGENT_PLIST)],
+            capture_output=True,
+        )
+        print("Watcher stopped.")
+        return 0
+
+    pid = _read_pid()
+    if pid:
+        try:
+            os.kill(pid, 15)
+            print(f"Watcher stopped (pid {pid}).")
+        except ProcessLookupError:
+            print("Watcher was not running.")
+    else:
+        print("Watcher was not running.")
+    return 0
+
+
+def cmd_restart(args) -> int:
+    cmd_stop(args)
+    time.sleep(1)
+    return cmd_start(args)
+
+
+def cmd_status(args) -> int:
+    running = _is_daemon_running() or (is_enabled() and shutil.which("launchctl"))
+    status_str = "RUNNING" if running else "STOPPED"
+    pid = _read_pid()
+    pid_str = f" (pid {pid})" if pid else ""
+    print(f"Watcher status: {status_str}{pid_str}")
+
+    channels = get_active_channels()
+    config = load_config()
+
+    channel_descs = []
+    if "imessage" in channels:
+        to = config.get("imessage", {}).get("to", "")
+        channel_descs.append(f"iMessage ({to})" if to else "iMessage")
+    if "telegram" in channels:
+        chat = config.get("telegram", {}).get("chat_id", "")
+        channel_descs.append(f"Telegram (chat {chat})" if chat else "Telegram")
+
+    print(f"Channels: {', '.join(channel_descs) if channel_descs else 'none'}")
+    print(f"Timeout: {config.get('timeout_minutes', 30)}min")
+    print()
+
+    active = session_manager.active()
+    parked = session_manager.parked()
+    all_sessions = active + parked
+
+    if all_sessions:
+        print(f"Sessions ({len(all_sessions)}):")
+        for s in all_sessions:
+            status_emoji = "🟢" if s.status == "active" else "🟡"
+            elapsed = _format_duration(s.elapsed_seconds)
+            channels_label = _channel_label(s)
+            task_short = s.task[:40] + ("…" if len(s.task) > 40 else "")
+            print(f"  {status_emoji} {s.project_name:<16} {s.status:<8} {elapsed:<8} {channels_label:<16} {task_short}")
+    else:
+        print("Sessions: none")
+
+    # Pending conversations
+    conv_count = 0
+    if CONVERSATIONS_DIR.exists():
+        conv_count = sum(1 for d in CONVERSATIONS_DIR.iterdir() if d.is_dir())
+    if conv_count:
+        print(f"\nConversations: {conv_count} pending")
+
+    return 0
+
+
+def cmd_sessions(args) -> int:
+    sub = args.sessions_cmd if hasattr(args, "sessions_cmd") else "list"
+
+    if sub == "list" or sub is None:
+        return cmd_status(args)
+
+    elif sub == "kill":
+        name = args.session_name if hasattr(args, "session_name") else ""
+        if not name:
+            print("Usage: watcher sessions kill <name>")
+            return 1
+        sessions = session_manager.find_by_name(name)
+        if not sessions:
+            print(f"No session found for '{name}'")
+            return 1
+        for s in sessions:
+            ok = session_manager.kill(s.session_id)
+            if ok:
+                print(f"Killed: {s.project_name}")
+            else:
+                print(f"Failed to kill: {s.project_name}")
+        return 0
+
+    elif sub == "clean":
+        count = session_manager.clean()
+        print(f"Cleaned {count} completed session(s).")
+        return 0
+
+    return 1
+
+
+def cmd_notify(args) -> int:
+    action = args.notify_action if hasattr(args, "notify_action") else "on"
+    name = args.session_name if hasattr(args, "session_name") else ""
+
+    # Find target sessions
+    if name:
+        sessions = session_manager.find_by_name(name)
+        if not sessions:
+            print(f"No session found for '{name}'")
+            return 1
+    else:
+        sessions = session_manager.active() + session_manager.parked()
+        if not sessions:
+            print("No active sessions.")
+            return 0
+        if len(sessions) > 1:
+            print("Active sessions:")
+            for i, s in enumerate(sessions, 1):
+                print(f"  {i} · {s.project_name} — {_channel_label(s)}")
+            print("\nSpecify a session name: watcher notify <action> <name>")
+            return 0
+
+    for s in sessions:
+        if action == "on":
+            session_manager.set_channel(s.session_id, "imessage", True)
+            session_manager.set_channel(s.session_id, "telegram", True)
+            print(f"🔔 {s.project_name}: notifications ON (both channels)")
+        elif action == "off":
+            session_manager.set_channel(s.session_id, "imessage", False)
+            session_manager.set_channel(s.session_id, "telegram", False)
+            print(f"🔕 {s.project_name}: notifications OFF")
+        elif action == "imessage":
+            current = s.notify_imessage
+            session_manager.set_channel(s.session_id, "imessage", not current)
+            state = "OFF" if current else "ON"
+            print(f"🔔 {s.project_name}: iMessage {state}")
+        elif action == "telegram":
+            current = s.notify_telegram
+            session_manager.set_channel(s.session_id, "telegram", not current)
+            state = "OFF" if current else "ON"
+            print(f"🔔 {s.project_name}: Telegram {state}")
+
+    return 0
+
+
+def cmd_recent(args) -> int:
+    sessions = session_manager.recent(24)
+    if not sessions:
+        print("No sessions in the last 24 hours.")
+        return 0
+
+    print("Recent sessions (last 24h):")
+    for s in sessions:
+        emoji = {"active": "🟢", "parked": "🟡", "completed": "✓", "expired": "🗑"}.get(s.status, "?")
+        elapsed = _format_duration(s.elapsed_seconds)
+        task_short = s.task[:40] + ("…" if len(s.task) > 40 else "")
+        print(f"  {emoji} {s.project_name:<16} {s.status:<12} {elapsed:<10} {task_short}")
+    return 0
+
+
+def cmd_history(args) -> int:
+    project = args.project if hasattr(args, "project") and args.project else ""
+    limit = args.limit if hasattr(args, "limit") and args.limit else 20
+    today_only = args.today if hasattr(args, "today") else False
+
+    if not ARCHIVE_DIR.exists():
+        print("No history yet.")
+        return 0
+
+    entries = []
+    today_start = time.time() - (time.time() % 86400) if today_only else 0
+
+    for d in sorted(ARCHIVE_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+        if not d.is_dir():
+            continue
+        pname = (d / "project_name").read_text().strip() if (d / "project_name").exists() else ""
+        if project and pname.lower() != project.lower():
+            continue
+
+        archived_at_raw = (d / "archived_at").read_text().strip() if (d / "archived_at").exists() else "0"
+        try:
+            archived_at = float(archived_at_raw)
+        except ValueError:
+            archived_at = 0
+
+        if today_only and archived_at < today_start:
+            continue
+
+        started_raw = (d / "started_at").read_text().strip() if (d / "started_at").exists() else "0"
+        completed_raw = (d / "completed_at").read_text().strip() if (d / "completed_at").exists() else ""
+        try:
+            started = float(started_raw)
+            completed = float(completed_raw) if completed_raw else started
+            duration = completed - started
+        except ValueError:
+            duration = 0
+
+        task = (d / "task").read_text().strip() if (d / "task").exists() else ""
+        outcome = (d / "outcome").read_text().strip() if (d / "outcome").exists() else "completed"
+
+        time_ago = _format_time_ago(archived_at)
+        entries.append((pname, time_ago, _format_duration(duration), task, outcome))
+
+        if len(entries) >= limit:
+            break
+
+    if not entries:
+        print(f"No history{' for ' + project if project else ''}.")
+        return 0
+
+    title = f"History{' · ' + project if project else ''}"
+    print(title)
+    print()
+    for pname, time_ago, duration, task, outcome in entries:
+        emoji = {"completed": "✓", "killed": "💀", "expired": "🗑"}.get(outcome, "⚠️")
+        task_short = task[:50] + ("…" if len(task) > 50 else "")
+        prefix = f"  {pname:<16}" if not project else "  "
+        print(f"{prefix}{emoji}  {time_ago:<15} {duration:<10} {task_short}")
+
+    return 0
+
+
+def _format_time_ago(ts: float) -> str:
+    diff = time.time() - ts
+    if diff < 3600:
+        return f"{int(diff / 60)}min ago"
+    if diff < 86400:
+        h = int(diff / 3600)
+        return f"{h}hr ago"
+    if diff < 86400 * 2:
+        return "Yesterday"
+    return f"{int(diff / 86400)}d ago"
+
+
+def cmd_config(args) -> int:
+    from config import CONFIG_PATH
+    ensure_dirs()
+    if not CONFIG_PATH.exists():
+        config = load_config()
+        save_config(config)
+    editor = os.environ.get("EDITOR", "nano")
+    subprocess.run([editor, str(CONFIG_PATH)])
+    return 0
+
+
+def cmd_logs(args) -> int:
+    log_file = LOGS_DIR / "watcherd.log"
+    if not log_file.exists():
+        print(f"Log file not found: {log_file}")
+        return 1
+    subprocess.run(["tail", "-f", str(log_file)])
+    return 0
+
+
+def cmd_doctor(args) -> int:
+    """Check dependencies, permissions, and configuration."""
+    print("watcher doctor\n")
+    all_ok = True
+    auto_fixed = 0
+
+    def check(label: str, ok: bool, fix_fn=None, fix_label: str = "") -> bool:
+        nonlocal auto_fixed, all_ok
+        if ok:
+            print(f"  ✓ {label}")
+            return True
+        else:
+            print(f"  ✗ {label}")
+            if fix_fn:
+                print(f"    → Auto-fixing... ", end="", flush=True)
+                try:
+                    fix_fn()
+                    print("✓ fixed")
+                    auto_fixed += 1
+                    return True
+                except Exception as e:
+                    print(f"✗ failed: {e}")
+            all_ok = False
+            return False
+
+    # Dependencies
+    check("imsg found", bool(shutil.which("imsg")))
+    check("claude found", bool(shutil.which("claude")))
+    check("jq found", bool(shutil.which("jq")))
+    check("python3 found", bool(shutil.which("python3")))
+
+    # Try httpx
+    try:
+        import httpx
+        check("httpx installed", True)
+    except ImportError:
+        check("httpx installed", False)
+
+    # Directories
+    check("~/.claude-watch/ exists", WATCH_DIR.exists(),
+          lambda: ensure_dirs(), "creating directory")
+    check("sessions/ exists", SESSIONS_DIR.exists(),
+          lambda: SESSIONS_DIR.mkdir(parents=True, exist_ok=True))
+    check("logs/ exists", LOGS_DIR.exists(),
+          lambda: LOGS_DIR.mkdir(parents=True, exist_ok=True))
+
+    # Hook scripts
+    for hook in ("session-start.sh", "notify.sh", "stop.sh"):
+        hook_path = HOOKS_DIR / hook
+        check(f"{hook} exists", hook_path.exists())
+        if hook_path.exists():
+            check(f"{hook} is executable", os.access(hook_path, os.X_OK),
+                  lambda p=hook_path: p.chmod(0o755), "fixing permissions")
+
+    # Config
+    from config import CONFIG_PATH, PROJECTS_PATH
+    check("config.json exists", CONFIG_PATH.exists())
+    check("projects.json exists", PROJECTS_PATH.exists())
+
+    # Telegram config
+    config = load_config()
+    tg = config.get("telegram", {})
+    if tg.get("enabled"):
+        check("Telegram token set", bool(tg.get("token")))
+        check("Telegram chat_id set", bool(tg.get("chat_id")))
+
+    # iMessage config
+    im = config.get("imessage", {})
+    if im.get("enabled"):
+        check("iMessage 'to' set", bool(im.get("to")))
+
+    # LaunchAgent
+    if sys.platform == "darwin":
+        check("LaunchAgent installed", LAUNCHAGENT_PLIST.exists())
+
+    # Claude Code hooks
+    claude_settings = Path.home() / ".claude" / "settings.json"
+    if claude_settings.exists():
+        try:
+            with open(claude_settings) as f:
+                settings = json.load(f)
+            hooks = settings.get("hooks", {})
+            check("SessionStart hook configured", "SessionStart" in hooks)
+            check("Notification hook configured", "Notification" in hooks)
+            check("Stop hook configured", "Stop" in hooks)
+        except (json.JSONDecodeError, OSError):
+            check("settings.json readable", False)
+    else:
+        print("  ✗ ~/.claude/settings.json not found — run 'watcher install' to configure")
+        all_ok = False
+
+    print()
+    if all_ok:
+        suffix = f" ({auto_fixed} auto-fixed)" if auto_fixed else ""
+        print(f"  ✓ All checks passed{suffix}")
+    else:
+        print("  Some issues need manual attention. See above.")
+    return 0 if all_ok else 1
+
+
+def cmd_install(args) -> int:
+    """First-time setup wizard."""
+    print("Watcher — first-time setup\n")
+    ensure_dirs()
+    config = load_config()
+
+    # Check dependencies
+    print("Checking dependencies...")
+    missing = []
+    for dep in ("imsg", "claude", "jq"):
+        if shutil.which(dep):
+            print(f"  ✓ {dep}")
+        else:
+            print(f"  ✗ {dep} — not found")
+            missing.append(dep)
+
+    if "imsg" in missing:
+        print("    Install imsg: brew install steipete/tap/imsg")
+    if "claude" in missing:
+        print("    Install Claude Code CLI: https://docs.anthropic.com/claude-code")
+    if "jq" in missing:
+        print("    Install jq: brew install jq")
+
+    print()
+
+    # iMessage setup
+    print("iMessage setup:")
+    use_imsg = input("  Enable iMessage? [y/N]: ").strip().lower() == "y"
+    if use_imsg:
+        apple_id = input("  Your Apple ID (iCloud email): ").strip()
+        config["imessage"]["enabled"] = True
+        config["imessage"]["to"] = apple_id
+        print(f"  ✓ iMessage target: {apple_id}")
+    print()
+
+    # Telegram setup
+    print("Telegram setup (optional — better buttons, works on any device):")
+    skip_tg = input("  Skip Telegram? [y/N]: ").strip().lower() == "y"
+    if not skip_tg:
+        print("  1. Open Telegram → message @BotFather → send /newbot")
+        token = input("  2. Paste your bot token: ").strip()
+        if token:
+            config["telegram"]["enabled"] = True
+            config["telegram"]["token"] = token
+            print("  ✓ Token saved")
+            print("  3. Send any message to your bot now to register your chat ID...")
+            chat_id = _detect_telegram_chat_id(token)
+            if chat_id:
+                config["telegram"]["chat_id"] = str(chat_id)
+                print(f"  ✓ Chat ID detected: {chat_id}")
+            else:
+                chat_id_input = input("  Could not auto-detect. Enter your chat ID manually: ").strip()
+                if chat_id_input:
+                    config["telegram"]["chat_id"] = chat_id_input
+    print()
+
+    # Projects
+    print("Adding projects...")
+    projects = {}
+    while True:
+        name = input("  Project name (or 'done'): ").strip()
+        if name.lower() == "done" or not name:
+            break
+        default_path = str(Path.home() / "projects" / name)
+        path = input(f"  Path [{default_path}]: ").strip() or default_path
+        projects[name] = path
+        print(f"  ✓ Added: {name} → {path}")
+
+    if projects:
+        from config import PROJECTS_PATH, save_projects
+        existing = {"default": "", "projects": {}}
+        existing["projects"].update(projects)
+        if projects:
+            existing["default"] = list(projects.keys())[0]
+        save_projects(existing)
+
+    print()
+
+    # Default channel
+    configured_channels = []
+    if config.get("imessage", {}).get("enabled"):
+        configured_channels.append("imessage")
+    if config.get("telegram", {}).get("enabled"):
+        configured_channels.append("telegram")
+
+    if configured_channels:
+        default_ch = input(f"  Default channel [{'/'.join(configured_channels)}/both]: ").strip().lower()
+        if default_ch == "both" or not default_ch:
+            config["default_channels"] = configured_channels
+        elif default_ch in ("imessage", "telegram"):
+            config["default_channels"] = [default_ch]
+    print()
+
+    # Save config
+    save_config(config)
+
+    # Voice aliases
+    print("Voice dictation aliases (optional):")
+    print("If your device misrecognises 'watcher', add aliases.")
+    aliases = {}
+    while True:
+        alias = input("  Alias (or enter to skip): ").strip()
+        if not alias:
+            break
+        aliases[alias.lower()] = "watcher"
+        print(f"  ✓ Alias saved: '{alias}' → 'watcher'")
+    if aliases:
+        config["voice_aliases"] = aliases
+        save_config(config)
+    print()
+
+    # Install hook scripts
+    print("Installing hooks into ~/.claude-watch/hooks/...")
+    _install_hooks()
+    print("  ✓ Hook scripts installed")
+
+    # Configure Claude Code settings.json
+    print("Installing hooks into ~/.claude/settings.json...")
+    _install_claude_hooks()
+    print("  ✓ Claude Code hooks configured")
+
+    # LaunchAgent
+    if sys.platform == "darwin":
+        print("Installing LaunchAgent...")
+        _install_launchagent()
+        print(f"  ✓ {LAUNCHAGENT_LABEL}.plist installed")
+
+    print()
+    print("Setup complete.")
+    print("  watcher start   — go")
+    print("  watcher doctor  — verify")
+    return 0
+
+
+def _detect_telegram_chat_id(token: str, timeout: int = 30) -> int | None:
+    """Poll getUpdates to detect the chat ID of the first message."""
+    import urllib.request
+    import urllib.parse
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+    start = time.time()
+    while time.time() - start < timeout:
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                data = json.loads(resp.read())
+                for update in data.get("result", []):
+                    msg = update.get("message", {})
+                    if msg:
+                        return msg.get("chat", {}).get("id")
+        except Exception:
+            pass
+        time.sleep(2)
+    return None
+
+
+def _install_hooks() -> None:
+    """Copy hook scripts to ~/.claude-watch/hooks/."""
+    src_hooks = Path(__file__).parent / "hooks"
+    HOOKS_DIR.mkdir(parents=True, exist_ok=True)
+
+    for hook in ("session-start.sh", "notify.sh", "stop.sh"):
+        src = src_hooks / hook
+        if src.exists():
+            dest = HOOKS_DIR / hook
+            shutil.copy2(src, dest)
+            dest.chmod(0o755)
+
+    # Copy send.py
+    send_py_src = Path(__file__).parent / "src" / "send.py"
+    if send_py_src.exists():
+        send_py_dest = WATCH_DIR / "send.py"
+        shutil.copy2(send_py_src, send_py_dest)
+        send_py_dest.chmod(0o755)
+
+    # Update shebang in send.py to use correct python
+    send_py_dest = WATCH_DIR / "send.py"
+    if send_py_dest.exists():
+        content = send_py_dest.read_text()
+        content = content.replace(
+            "#!/usr/bin/env python3",
+            f"#!{sys.executable}",
+        )
+        send_py_dest.write_text(content)
+
+
+def _install_claude_hooks() -> None:
+    """Add watcher hooks to ~/.claude/settings.json."""
+    claude_dir = Path.home() / ".claude"
+    claude_dir.mkdir(parents=True, exist_ok=True)
+    settings_path = claude_dir / "settings.json"
+
+    if settings_path.exists():
+        try:
+            with open(settings_path) as f:
+                settings = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            settings = {}
+    else:
+        settings = {}
+
+    hooks_dir = str(HOOKS_DIR)
+    settings.setdefault("hooks", {})
+
+    for event, script in [
+        ("SessionStart", "session-start.sh"),
+        ("Notification", "notify.sh"),
+        ("Stop", "stop.sh"),
+    ]:
+        hook_cmd = str(HOOKS_DIR / script)
+        timeout = 5 if event == "SessionStart" else 10
+        settings["hooks"][event] = [{
+            "matcher": "",
+            "hooks": [{
+                "type": "command",
+                "command": hook_cmd,
+                "timeout": timeout,
+            }],
+        }]
+
+    with open(settings_path, "w") as f:
+        json.dump(settings, f, indent=2)
+        f.write("\n")
+
+
+def _install_launchagent() -> None:
+    """Install the LaunchAgent plist."""
+    LAUNCHAGENT_PLIST.parent.mkdir(parents=True, exist_ok=True)
+
+    watcherd_bin = shutil.which("watcherd") or str(SRC_DIR / "watcherd.py")
+
+    plist = PLIST_TEMPLATE.format(
+        watcherd_bin=watcherd_bin,
+        enabled_flag=str(ENABLED_FLAG),
+        log_out=str(LOGS_DIR / "watcherd.log"),
+        log_err=str(LOGS_DIR / "watcherd-error.log"),
+    )
+    LAUNCHAGENT_PLIST.write_text(plist)
+
+
+# ─── Argument parser ────────────────────────────────────────────────────────
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="watcher",
+        description="Remote control Claude Code via iMessage and Telegram",
+    )
+    sub = parser.add_subparsers(dest="command")
+
+    # start
+    p_start = sub.add_parser("start", help="Start the daemon")
+    p_start.add_argument("--imessage", action="store_true")
+    p_start.add_argument("--telegram", action="store_true")
+    p_start.add_argument("--no-imessage", action="store_true", dest="no_imessage")
+    p_start.add_argument("--no-telegram", action="store_true", dest="no_telegram")
+
+    # stop / restart
+    sub.add_parser("stop", help="Stop the daemon")
+    sub.add_parser("restart", help="Restart the daemon")
+
+    # status / sessions
+    sub.add_parser("status", help="Show daemon state and sessions")
+    p_sessions = sub.add_parser("sessions", help="Manage sessions")
+    sessions_sub = p_sessions.add_subparsers(dest="sessions_cmd")
+    sessions_sub.add_parser("list")
+    p_kill = sessions_sub.add_parser("kill")
+    p_kill.add_argument("session_name")
+    sessions_sub.add_parser("clean")
+
+    # notify
+    p_notify = sub.add_parser("notify", help="Toggle notifications")
+    p_notify.add_argument("notify_action", choices=["on", "off", "imessage", "telegram"],
+                          nargs="?", default="on")
+    p_notify.add_argument("session_name", nargs="?", default="")
+
+    # recent / history
+    sub.add_parser("recent", help="Show recent sessions")
+    p_history = sub.add_parser("history", help="Show session history")
+    p_history.add_argument("project", nargs="?", default="")
+    p_history.add_argument("--today", action="store_true")
+    p_history.add_argument("--limit", type=int, default=20)
+
+    # utility
+    sub.add_parser("config", help="Open config in $EDITOR")
+    sub.add_parser("logs", help="Tail daemon logs")
+    sub.add_parser("install", help="Run first-time setup wizard")
+    sub.add_parser("doctor", help="Check dependencies and configuration")
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.command is None:
+        parser.print_help()
+        return 0
+
+    dispatch = {
+        "start": cmd_start,
+        "stop": cmd_stop,
+        "restart": cmd_restart,
+        "status": cmd_status,
+        "sessions": cmd_sessions,
+        "notify": cmd_notify,
+        "recent": cmd_recent,
+        "history": cmd_history,
+        "config": cmd_config,
+        "logs": cmd_logs,
+        "install": cmd_install,
+        "doctor": cmd_doctor,
+    }
+
+    handler = dispatch.get(args.command)
+    if handler:
+        return handler(args)
+
+    parser.print_help()
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
